@@ -23,6 +23,10 @@ const figmaClients = new Set();
 // Key: clientId, Value: { timestamp, data }
 const selectionCache = new Map();
 
+// Variables cache - stores Figma Variable collections (v5.2)
+// Key: clientId, Value: { timestamp, variables: [], fileKey }
+const variablesCache = new Map();
+
 // Pending requests waiting for Figma response
 // Key: requestId, Value: { resolve, reject, timeout }
 const pendingRequests = new Map();
@@ -90,6 +94,19 @@ wss.on('connection', (ws) => {
         return;
       }
       
+      // Handle variables data from Figma (v5.2)
+      if (data.type === 'variables-data') {
+        variablesCache.set(clientId, {
+          timestamp: Date.now(),
+          variables: data.variables || [],
+          fileKey: data.fileKey || null,
+          fileName: data.fileName || null,
+          collectionCount: data.collectionCount || 0
+        });
+        console.log(`Variables received from ${clientId}: ${data.variables?.length || 0} variables from ${data.collectionCount || 0} collections`);
+        return;
+      }
+      
     } catch (err) {
       console.error('Message parse error:', err);
     }
@@ -99,12 +116,13 @@ wss.on('connection', (ws) => {
     console.log(`Figma plugin disconnected: ${clientId}`);
     figmaClients.delete(ws);
     selectionCache.delete(clientId);
+    variablesCache.delete(clientId);
   });
   
   ws.send(JSON.stringify({ 
     type: 'connected', 
     clientId: clientId,
-    message: 'Connected to Figma Relay Server v3.0' 
+    message: 'Connected to Figma Relay Server v5.2' 
   }));
 });
 
@@ -175,15 +193,15 @@ function sendAndWait(message, timeoutMs = REQUEST_TIMEOUT) {
 // Health check
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'Figma Relay Server v3.0 is running',
-    version: '3.0',
+    status: 'Figma Relay Server v5.2 is running',
+    version: '5.2',
     clients: figmaClients.size,
-    features: ['bidirectional', 'selection-read', 'node-update']
+    features: ['bidirectional', 'selection-read', 'node-update', 'variable-sync']
   });
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '3.0', clients: figmaClients.size });
+  res.json({ status: 'ok', version: '5.2', clients: figmaClients.size });
 });
 
 // -----------------------------------------------------------------------------
@@ -409,11 +427,53 @@ app.post('/api/figma/delete', authMiddleware, async (req, res) => {
   }
 });
 
+// -----------------------------------------------------------------------------
+// GET VARIABLES - Get Figma Variable collections (v5.2)
+// -----------------------------------------------------------------------------
+app.get('/api/figma/variables', authMiddleware, (req, res) => {
+  const allVariables = [];
+  
+  variablesCache.forEach((value, clientId) => {
+    allVariables.push({
+      clientId,
+      timestamp: value.timestamp,
+      age: Date.now() - value.timestamp,
+      fileKey: value.fileKey,
+      fileName: value.fileName,
+      collectionCount: value.collectionCount,
+      variables: value.variables
+    });
+  });
+  
+  if (allVariables.length === 0) {
+    return res.json({
+      success: true,
+      message: 'No variables data available. Variables are synced automatically when Figma plugin connects.',
+      variables: []
+    });
+  }
+  
+  // Return most recent
+  allVariables.sort((a, b) => b.timestamp - a.timestamp);
+  const latest = allVariables[0];
+  
+  res.json({
+    success: true,
+    message: 'Variables retrieved',
+    fileKey: latest.fileKey,
+    fileName: latest.fileName,
+    collectionCount: latest.collectionCount,
+    variableCount: latest.variables.length,
+    variables: latest.variables,
+    timestamp: latest.timestamp
+  });
+});
+
 // =============================================================================
 // START SERVER
 // =============================================================================
 
 server.listen(PORT, () => {
-  console.log(`Figma Relay Server v3.0 running on port ${PORT}`);
-  console.log('Features: bidirectional communication, selection reading, node updates');
+  console.log(`Figma Relay Server v5.2 running on port ${PORT}`);
+  console.log('Features: bidirectional communication, selection reading, node updates, variable sync');
 });
