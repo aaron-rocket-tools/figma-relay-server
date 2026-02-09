@@ -9,6 +9,7 @@ const wss = new WebSocketServer({ server });
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.FIGMA_RELAY_API_KEY || 'change-this-key';
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -107,6 +108,12 @@ wss.on('connection', (ws) => {
         return;
       }
       
+      // Handle analyze-frames request via WebSocket (v5.5)
+      if (data.type === 'analyze-frames') {
+        handleAnalyzeFramesWS(ws, data.frames || []);
+        return;
+      }
+      
     } catch (err) {
       console.error('Message parse error:', err);
     }
@@ -122,7 +129,7 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({ 
     type: 'connected', 
     clientId: clientId,
-    message: 'Connected to Figma Relay Server v5.2' 
+    message: 'Connected to Figma Relay Server v5.5' 
   }));
 });
 
@@ -186,6 +193,83 @@ function sendAndWait(message, timeoutMs = REQUEST_TIMEOUT) {
   });
 }
 
+/**
+ * Handle analyze-frames request via WebSocket (v5.5)
+ * Calls Anthropic API and sends result back to the requesting client
+ */
+async function handleAnalyzeFramesWS(clientWs, frames) {
+  if (!frames || frames.length === 0) {
+    clientWs.send(JSON.stringify({ type: 'analyze-result', success: false, error: 'No frames provided' }));
+    return;
+  }
+  
+  if (!ANTHROPIC_API_KEY) {
+    clientWs.send(JSON.stringify({ type: 'analyze-result', success: false, error: 'ANTHROPIC_API_KEY not configured' }));
+    return;
+  }
+  
+  const frameSummaries = frames.map((f, i) => {
+    return `Frame ${i + 1} (id: ${f.id}, current name: "${f.name}", size: ${f.width}x${f.height}):\n${f.nodeTree}`;
+  }).join('\n\n---\n\n');
+  
+  const systemPrompt = `You are a Figma frame naming assistant. Analyze the node tree of each frame and suggest a descriptive Korean name.
+
+Rules:
+- Format: "PageName-NN_설명" (e.g., "Onboarding-01_스크립트 설치 안내", "Dashboard-01_매출 요약 카드")
+- PageName: Infer the logical page/section from content (English, PascalCase)
+- NN: Sequential number starting from 01
+- 설명: Brief Korean description of the frame's purpose (max 15 chars)
+- If multiple frames belong to the same logical page, use the same PageName with different NN
+- If you cannot determine a meaningful name, use "Unnamed-NN_프레임 설명"
+
+Respond ONLY with a JSON array. Each element: {"frameId": "...", "suggestedName": "...", "pageName": "...", "reason": "..."}
+No markdown fences, no explanation outside the JSON.`;
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 4096,
+        system: systemPrompt,
+        messages: [
+          { role: 'user', content: `Analyze these ${frames.length} Figma frame(s) and suggest names:\n\n${frameSummaries}` }
+        ]
+      })
+    });
+    
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error('Anthropic API error:', response.status, errText);
+      clientWs.send(JSON.stringify({ type: 'analyze-result', success: false, error: `API error: ${response.status}` }));
+      return;
+    }
+    
+    const data = await response.json();
+    const text = data.content?.[0]?.text || '[]';
+    
+    let suggestions;
+    try {
+      suggestions = JSON.parse(text.replace(/```json|```/g, '').trim());
+    } catch (parseErr) {
+      console.error('LLM response parse error:', text);
+      clientWs.send(JSON.stringify({ type: 'analyze-result', success: false, error: 'Failed to parse LLM response' }));
+      return;
+    }
+    
+    console.log(`Frame analysis complete: ${suggestions.length} suggestions`);
+    clientWs.send(JSON.stringify({ type: 'analyze-result', success: true, suggestions: suggestions }));
+  } catch (err) {
+    console.error('Analyze frames error:', err);
+    clientWs.send(JSON.stringify({ type: 'analyze-result', success: false, error: err.message }));
+  }
+}
+
 // =============================================================================
 // API ENDPOINTS
 // =============================================================================
@@ -193,15 +277,15 @@ function sendAndWait(message, timeoutMs = REQUEST_TIMEOUT) {
 // Health check
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'Figma Relay Server v5.2 is running',
-    version: '5.2',
+    status: 'Figma Relay Server v5.5 is running',
+    version: '5.5',
     clients: figmaClients.size,
-    features: ['bidirectional', 'selection-read', 'node-update', 'variable-sync']
+    features: ['bidirectional', 'selection-read', 'node-update', 'variable-sync', 'frame-naming']
   });
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '5.2', clients: figmaClients.size });
+  res.json({ status: 'ok', version: '5.5', clients: figmaClients.size });
 });
 
 // -----------------------------------------------------------------------------
@@ -469,11 +553,89 @@ app.get('/api/figma/variables', authMiddleware, (req, res) => {
   });
 });
 
+// -----------------------------------------------------------------------------
+// ANALYZE FRAMES - LLM-based frame naming (v5.5)
+// -----------------------------------------------------------------------------
+app.post('/api/figma/analyze-frames', authMiddleware, async (req, res) => {
+  const { frames } = req.body;
+  
+  if (!frames || !Array.isArray(frames) || frames.length === 0) {
+    return res.status(400).json({ error: 'Missing or empty frames array' });
+  }
+  
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
+  }
+  
+  // Build frame summaries for LLM
+  const frameSummaries = frames.map((f, i) => {
+    return `Frame ${i + 1} (id: ${f.id}, current name: "${f.name}", size: ${f.width}x${f.height}):\n${f.nodeTree}`;
+  }).join('\n\n---\n\n');
+  
+  const systemPrompt = `You are a Figma frame naming assistant. Analyze the node tree of each frame and suggest a descriptive Korean name.
+
+Rules:
+- Format: "PageName-NN_설명" (e.g., "Onboarding-01_스크립트 설치 안내", "Dashboard-01_매출 요약 카드")
+- PageName: Infer the logical page/section from content (English, PascalCase)
+- NN: Sequential number starting from 01
+- 설명: Brief Korean description of the frame's purpose (max 15 chars)
+- If multiple frames belong to the same logical page, use the same PageName with different NN
+- If you cannot determine a meaningful name, use "Unnamed-NN_프레임 설명"
+
+Respond ONLY with a JSON array. Each element: {"frameId": "...", "suggestedName": "...", "pageName": "...", "reason": "..."}
+No markdown fences, no explanation outside the JSON.`;
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 4096,
+        system: systemPrompt,
+        messages: [
+          { role: 'user', content: `Analyze these ${frames.length} Figma frame(s) and suggest names:\n\n${frameSummaries}` }
+        ]
+      })
+    });
+    
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error('Anthropic API error:', response.status, errText);
+      return res.status(502).json({ error: `Anthropic API error: ${response.status}` });
+    }
+    
+    const data = await response.json();
+    const text = data.content?.[0]?.text || '[]';
+    
+    // Parse LLM response
+    let suggestions;
+    try {
+      suggestions = JSON.parse(text.replace(/```json|```/g, '').trim());
+    } catch (parseErr) {
+      console.error('LLM response parse error:', text);
+      return res.status(502).json({ error: 'Failed to parse LLM response', raw: text });
+    }
+    
+    res.json({
+      success: true,
+      suggestions: suggestions
+    });
+  } catch (err) {
+    console.error('Analyze frames error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // =============================================================================
 // START SERVER
 // =============================================================================
 
 server.listen(PORT, () => {
-  console.log(`Figma Relay Server v5.2 running on port ${PORT}`);
-  console.log('Features: bidirectional communication, selection reading, node updates, variable sync');
+  console.log(`Figma Relay Server v5.5 running on port ${PORT}`);
+  console.log('Features: bidirectional communication, selection reading, node updates, variable sync, frame naming');
 });
